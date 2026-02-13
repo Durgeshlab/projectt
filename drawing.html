@@ -1,0 +1,860 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Tactical Drawing Map</title>
+
+    <link rel="stylesheet" href="/web/leaflet.css" />
+    <script src="/web/leaflet.js"></script>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
+    <style>
+      html,
+      body,
+      #map {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        background: #0a0a0a;
+      }
+
+      .leaflet-container {
+        background: #0a0a0a;
+      }
+
+      /* Aircraft marker */
+      .aircraft-marker {
+        width: 24px;
+        height: 24px;
+        background: transparent;
+        border: none;
+        padding: 0;
+        margin: 0;
+      }
+
+      .aircraft-marker .marker-inner {
+        width: 24px;
+        height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #00ff00;
+        font-size: 20px;
+        text-shadow: 0 0 5px #00ff00;
+        transform-origin: center center;
+      }
+
+      .track-marker {
+        width: 24px;
+        height: 24px;
+        background: transparent;
+        border: none;
+        padding: 0;
+        margin: 0;
+      }
+
+      .track-marker .marker-inner {
+        width: 24px;
+        height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+        filter: drop-shadow(0 0 3px #ff0000);
+        transform-origin: center center;
+      }
+
+      /* NEW: Waypoint editing markers */
+      .waypoint-handle {
+        width: 16px;
+        height: 16px;
+        background: #ffff00;
+        border: 2px solid #ffffff;
+        border-radius: 50%;
+        cursor: move;
+        box-shadow: 0 0 8px #ffff00;
+      }
+
+      .insertion-handle {
+        width: 14px;
+        height: 14px;
+        background: #00ffff;
+        border: 2px solid #ffffff;
+        border-radius: 50%;
+        cursor: pointer;
+        box-shadow: 0 0 6px #00ffff;
+        opacity: 0.7;
+      }
+
+      .insertion-handle:hover {
+        opacity: 1;
+        transform: scale(1.2);
+      }
+
+      .start-handle {
+        width: 18px;
+        height: 18px;
+        background: #00ff00;
+        border: 3px solid #ffffff;
+        cursor: move;
+        box-shadow: 0 0 10px #00ff00;
+      }
+
+      .end-handle {
+        width: 18px;
+        height: 18px;
+        background: #ff0000;
+        border: 3px solid #ffffff;
+        cursor: move;
+        box-shadow: 0 0 10px #ff0000;
+      }
+
+      /* Drawing instructions */
+      #draw-instructions {
+        position: absolute;
+        top: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0, 0, 0, 0.9);
+        color: #00ff00;
+        padding: 12px 24px;
+        border: 2px solid #00ff00;
+        border-radius: 5px;
+        font-family: "Courier New", monospace;
+        font-weight: bold;
+        font-size: 14px;
+        z-index: 1000;
+        display: none;
+      }
+
+      /* Editing mode instructions */
+      #edit-instructions {
+        position: absolute;
+        top: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0, 0, 0, 0.95);
+        color: #ffff00;
+        padding: 12px 24px;
+        border: 2px solid #ffff00;
+        border-radius: 5px;
+        font-family: "Courier New", monospace;
+        font-weight: bold;
+        font-size: 14px;
+        z-index: 1000;
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="draw-instructions">
+      Click on map to draw path. Double-click to finish.
+    </div>
+    <div id="edit-instructions">
+      🟡 Drag waypoints to move | 🔵 Click + to insert | Right-click to delete
+    </div>
+    <div id="map"></div>
+
+    <script>
+      // Initialize map - India centered, no black areas
+      var map = L.map("map", {
+        center: [20.5937, 78.9629],
+        zoom: 5,
+        minZoom: 2,
+        maxZoom: 18,
+        zoomControl: true,
+        worldCopyJump: true,
+        preferCanvas: true,
+      });
+
+      // Tile layer
+      L.tileLayer("/tiles/{z}/{x}/{y}.png", {
+        maxZoom: 18,
+        minZoom: 2,
+        maxNativeZoom: 8,
+        noWrap: false,
+        tileSize: 256,
+        keepBuffer: 4,
+        errorTileUrl:
+          "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=",
+      }).addTo(map);
+
+      try {
+        map.setMaxBounds([
+          [-90, -180],
+          [90, 180],
+        ]);
+      } catch (err) {}
+
+      setTimeout(() => {
+        map.invalidateSize();
+        map.setView([20.5937, 78.9629], 5);
+      }, 200);
+
+      window.addEventListener("resize", () => {
+        map.invalidateSize();
+      });
+
+      // Drawing state
+      var drawingMode = null;
+      var drawingPoints = [];
+      var tempPolyline = null;
+      var drawnPaths = {};
+      var aircraftMarkers = {};
+      var isDragging = false;
+      var dragDrawingType = "aircraft";
+
+      // Editing state
+      var editingMode = false;
+      var editingPathId = null;
+      var waypointHandles = [];
+      var insertionHandles = [];
+      var editingPolyline = null;
+      var editingPathData = null;
+      var originalPathDataCopy = null; // STORE ORIGINAL FOR CANCEL
+
+      // Layers
+      var aircraftPathLayer = L.layerGroup().addTo(map);
+      var trackPathLayer = L.layerGroup().addTo(map);
+      var markerLayer = L.layerGroup().addTo(map);
+      var editingLayer = L.layerGroup().addTo(map);
+
+      // Enable drawing
+      function enableDrawing(mode) {
+        drawingMode = mode;
+        drawingPoints = [];
+
+        var instructions = document.getElementById("draw-instructions");
+
+        if (mode === "drag_aircraft") {
+          dragDrawingType = "aircraft";
+          instructions.textContent = "Click and drag to draw AIRCRAFT path (Green). Release to finish.";
+          instructions.style.display = "block";
+          map.dragging.disable();
+          map.on("mousedown", onDragStart);
+        } else if (mode === "drag_track") {
+          dragDrawingType = "track";
+          instructions.textContent = "Click and drag to draw TRACK path (Red). Release to finish.";
+          instructions.style.display = "block";
+          map.dragging.disable();
+          map.on("mousedown", onDragStart);
+        } else if (mode === "aircraft") {
+          instructions.textContent = "Click on map to draw AIRCRAFT path. Double-click to finish.";
+          instructions.style.display = "block";
+          map.on("click", onMapClick);
+          map.on("dblclick", finishDrawing);
+        } else if (mode === "track") {
+          instructions.textContent = "Click on map to draw TRACK path. Double-click to finish.";
+          instructions.style.display = "block";
+          map.on("click", onMapClick);
+          map.on("dblclick", finishDrawing);
+        }
+
+        map.getContainer().style.cursor = "crosshair";
+      }
+
+      function disableDrawing() {
+        drawingMode = null;
+        drawingPoints = [];
+        document.getElementById("draw-instructions").style.display = "none";
+        map.off("click", onMapClick);
+        map.off("dblclick", finishDrawing);
+        map.off("mousedown", onDragStart);
+        map.off("mousemove", onDragMove);
+        map.off("mouseup", onDragEnd);
+        map.dragging.enable();
+        if (tempPolyline) {
+          map.removeLayer(tempPolyline);
+          tempPolyline = null;
+        }
+        map.getContainer().style.cursor = "";
+      }
+
+      function onMapClick(e) {
+        if (!drawingMode || drawingMode.startsWith("drag_")) return;
+        if (e.originalEvent && e.originalEvent.detail === 2) return;
+        L.DomEvent.stopPropagation(e);
+        drawingPoints.push([e.latlng.lat, e.latlng.lng]);
+        if (tempPolyline) map.removeLayer(tempPolyline);
+        var color = drawingMode === "aircraft" ? "#00ff00" : "#ff0000";
+        tempPolyline = L.polyline(drawingPoints, {
+          color: color,
+          weight: 3,
+          opacity: 0.7,
+          dashArray: "10, 10",
+        }).addTo(map);
+      }
+
+      function finishDrawing(e) {
+        if (!drawingMode || drawingPoints.length < 2 || drawingMode.startsWith("drag_")) return;
+        L.DomEvent.stopPropagation(e);
+        L.DomEvent.preventDefault(e);
+        var distance = calculatePathDistance(drawingPoints);
+        var pathData = { points: drawingPoints, distance_nm: distance, type: drawingMode };
+        if (typeof window.drawingBridge !== "undefined") {
+          window.drawingBridge.onPathDrawn(JSON.stringify(pathData));
+        }
+        if (tempPolyline) {
+          map.removeLayer(tempPolyline);
+          tempPolyline = null;
+        }
+        drawingPoints = [];
+      }
+
+      function onDragStart(e) {
+        if (!drawingMode || !drawingMode.startsWith("drag_")) return;
+        isDragging = true;
+        drawingPoints = [];
+        drawingPoints.push([e.latlng.lat, e.latlng.lng]);
+        map.on("mousemove", onDragMove);
+        map.on("mouseup", onDragEnd);
+      }
+
+      function onDragMove(e) {
+        if (!isDragging) return;
+        drawingPoints.push([e.latlng.lat, e.latlng.lng]);
+        if (tempPolyline) map.removeLayer(tempPolyline);
+        var color = dragDrawingType === "aircraft" ? "#00ff00" : "#ff0000";
+        tempPolyline = L.polyline(drawingPoints, {
+          color: color,
+          weight: 3,
+          opacity: 0.7,
+          dashArray: "10, 10",
+        }).addTo(map);
+      }
+
+      function onDragEnd(e) {
+        if (!isDragging) return;
+        isDragging = false;
+        map.off("mousemove", onDragMove);
+        map.off("mouseup", onDragEnd);
+        if (drawingPoints.length < 2) {
+          if (tempPolyline) {
+            map.removeLayer(tempPolyline);
+            tempPolyline = null;
+          }
+          drawingPoints = [];
+          return;
+        }
+        var distance = calculatePathDistance(drawingPoints);
+        var pathData = { points: drawingPoints, distance_nm: distance, type: dragDrawingType };
+        if (typeof window.drawingBridge !== "undefined") {
+          window.drawingBridge.onPathDrawn(JSON.stringify(pathData));
+        }
+        if (tempPolyline) {
+          map.removeLayer(tempPolyline);
+          tempPolyline = null;
+        }
+        drawingPoints = [];
+      }
+
+      function calculatePathDistance(points) {
+        if (points.length < 2) return 0;
+        var R = 3440.065;
+        var totalDistance = 0;
+        for (var i = 0; i < points.length - 1; i++) {
+          var p1 = points[i];
+          var p2 = points[i + 1];
+          var lat1 = toRad(p1[0]);
+          var lon1 = toRad(p1[1]);
+          var lat2 = toRad(p2[0]);
+          var lon2 = toRad(p2[1]);
+          var dlat = lat2 - lat1;
+          var dlon = lon2 - lon1;
+          var a = Math.sin(dlat / 2) * Math.sin(dlat / 2) +
+            Math.cos(lat1) * Math.cos(lat2) * Math.sin(dlon / 2) * Math.sin(dlon / 2);
+          var c = 2 * Math.asin(Math.sqrt(a));
+          totalDistance += R * c;
+        }
+        return totalDistance;
+      }
+
+      function toRad(deg) {
+        return (deg * Math.PI) / 180;
+      }
+
+      function addPath(pathDataJson) {
+        try {
+          var path = JSON.parse(pathDataJson);
+          console.log("[ADD PATH]", path.id, "Type:", path.type, "Points:", path.points.length);
+
+          // COMPLETELY REMOVE OLD if exists
+          if (drawnPaths[path.id]) {
+            console.log("[ADD PATH] Removing old version of", path.id);
+            if (drawnPaths[path.id].polyline) {
+              if (drawnPaths[path.id].path.type === "aircraft") {
+                aircraftPathLayer.removeLayer(drawnPaths[path.id].polyline);
+              } else {
+                trackPathLayer.removeLayer(drawnPaths[path.id].polyline);
+              }
+            }
+            if (drawnPaths[path.id].marker) {
+              markerLayer.removeLayer(drawnPaths[path.id].marker);
+            }
+            delete drawnPaths[path.id];
+            delete aircraftMarkers[path.id];
+          }
+
+          // CREATE NEW polyline
+          var color = path.type === "aircraft" ? "#00ff00" : "#ff0000";
+          var polyline = L.polyline(path.points, {
+            color: color,
+            weight: 2,
+            opacity: 0.6,
+          });
+
+          if (path.type === "aircraft") {
+            polyline.addTo(aircraftPathLayer);
+          } else {
+            polyline.addTo(trackPathLayer);
+          }
+
+          // CREATE NEW marker
+          var markerClass = path.type === "aircraft" ? "aircraft-marker" : "track-marker";
+          var htmlContent = path.type === "aircraft" 
+            ? '<div class="marker-inner">✈</div>' 
+            : '<div class="marker-inner">🎯</div>';
+
+          var icon = L.divIcon({
+            className: "leaflet-div-icon " + markerClass,
+            html: htmlContent,
+            iconSize: [24, 24],
+            iconAnchor: [12, 12],
+          });
+
+          var marker = L.marker(path.points[0], { icon: icon });
+          marker.addTo(markerLayer);
+          marker.setZIndexOffset(1000);
+
+          marker.bindPopup(
+            "<b>" + path.id + "</b><br>" +
+            "Speed: " + path.speed_kts + " kts<br>" +
+            "Alt: " + path.altitude_ft + " ft<br>" +
+            "Distance: " + path.distance_nm.toFixed(1) + " nm"
+          );
+
+          // STORE NEW
+          drawnPaths[path.id] = {
+            path: path,
+            polyline: polyline,
+            marker: marker,
+          };
+          aircraftMarkers[path.id] = marker;
+          
+          console.log("[ADD PATH] Successfully added", path.id);
+        } catch (e) {
+          console.error("[ADD PATH] Error:", e);
+        }
+      }
+
+      function updatePositions(updatesJson) {
+        try {
+          var updates = JSON.parse(updatesJson);
+          updates.forEach(function (update) {
+            if (aircraftMarkers[update.id]) {
+              var marker = aircraftMarkers[update.id];
+              marker.setLatLng([update.lat, update.lon]);
+              if (marker.setRotationAngle) {
+                marker.setRotationAngle(update.heading);
+              }
+              marker.setPopupContent(
+                "<b>" + update.id + "</b><br>" +
+                "Speed: " + Math.round(update.speed) + " kts<br>" +
+                "Alt: " + Math.round(update.alt) + " ft<br>" +
+                "Heading: " + Math.round(update.heading) + "°"
+              );
+            }
+          });
+        } catch (e) {
+          console.error("[UPDATE POS] Error:", e);
+        }
+      }
+
+      function clearAllPaths() {
+        aircraftPathLayer.clearLayers();
+        trackPathLayer.clearLayers();
+        markerLayer.clearLayers();
+        editingLayer.clearLayers();
+        drawnPaths = {};
+        aircraftMarkers = {};
+        editingMode = false;
+        editingPathId = null;
+      }
+
+      // ==================== PATH EDITING FUNCTIONS ====================
+
+      function startPathEditing(pathId) {
+        try {
+          console.log("[START EDIT]", pathId);
+          disableDrawing();
+          editingMode = true;
+          editingPathId = pathId;
+
+          if (!drawnPaths[pathId]) {
+            console.error("[START EDIT] Path not found:", pathId);
+            return;
+          }
+
+          // DEEP COPY original for cancel
+          var original = drawnPaths[pathId].path;
+          originalPathDataCopy = {
+            id: original.id,
+            type: original.type,
+            points: original.points.map(function(p) { return [p[0], p[1]]; }),
+            distance_nm: original.distance_nm,
+            speed_kts: original.speed_kts,
+            altitude_ft: original.altitude_ft,
+            current_position: original.current_position || 0,
+            color: original.color,
+            created: original.created
+          };
+          
+          // Working copy
+          editingPathData = drawnPaths[pathId].path;
+
+          // Hide original polyline
+          if (drawnPaths[pathId].polyline) {
+            map.removeLayer(drawnPaths[pathId].polyline);
+          }
+
+          // Create highlighted editing polyline
+          var color = editingPathData.type === "aircraft" ? "#00ff00" : "#ff0000";
+          editingPolyline = L.polyline(editingPathData.points, {
+            color: color,
+            weight: 4,
+            opacity: 0.9,
+          }).addTo(editingLayer);
+
+          createWaypointHandles();
+          createInsertionHandles();
+
+          document.getElementById("edit-instructions").style.display = "block";
+          map.dragging.disable();
+          
+          console.log("[START EDIT] Original saved:", originalPathDataCopy.points.length, "points");
+        } catch (e) {
+          console.error("[START EDIT] Error:", e);
+        }
+      }
+
+      function stopPathEditing() {
+        try {
+          console.log("[STOP EDIT] Cleaning up");
+          editingMode = false;
+          editingLayer.clearLayers();
+          waypointHandles = [];
+          insertionHandles = [];
+          editingPolyline = null;
+          editingPathId = null;
+          editingPathData = null;
+          originalPathDataCopy = null;
+          document.getElementById("edit-instructions").style.display = "none";
+          map.dragging.enable();
+          console.log("[STOP EDIT] Completed");
+        } catch (e) {
+          console.error("[STOP EDIT] Error:", e);
+        }
+      }
+
+      function restorePath(pathDataJson) {
+        try {
+          var path = JSON.parse(pathDataJson);
+          console.log("[RESTORE] Restoring", path.id, "with", path.points.length, "points");
+          
+          // COMPLETELY REMOVE current
+          if (drawnPaths[path.id]) {
+            if (drawnPaths[path.id].polyline) {
+              if (path.type === "aircraft") {
+                aircraftPathLayer.removeLayer(drawnPaths[path.id].polyline);
+              } else {
+                trackPathLayer.removeLayer(drawnPaths[path.id].polyline);
+              }
+            }
+            if (drawnPaths[path.id].marker) {
+              markerLayer.removeLayer(drawnPaths[path.id].marker);
+            }
+          }
+
+          // RE-ADD original
+          var color = path.type === "aircraft" ? "#00ff00" : "#ff0000";
+          var polyline = L.polyline(path.points, {
+            color: color,
+            weight: 2,
+            opacity: 0.6,
+          });
+
+          if (path.type === "aircraft") {
+            polyline.addTo(aircraftPathLayer);
+          } else {
+            polyline.addTo(trackPathLayer);
+          }
+
+          var markerClass = path.type === "aircraft" ? "aircraft-marker" : "track-marker";
+          var htmlContent = path.type === "aircraft" 
+            ? '<div class="marker-inner">✈</div>' 
+            : '<div class="marker-inner">🎯</div>';
+
+          var icon = L.divIcon({
+            className: "leaflet-div-icon " + markerClass,
+            html: htmlContent,
+            iconSize: [24, 24],
+            iconAnchor: [12, 12],
+          });
+
+          var marker = L.marker(path.points[0], { icon: icon });
+          marker.addTo(markerLayer);
+          marker.setZIndexOffset(1000);
+
+          marker.bindPopup(
+            "<b>" + path.id + "</b><br>" +
+            "Speed: " + path.speed_kts + " kts<br>" +
+            "Alt: " + path.altitude_ft + " ft<br>" +
+            "Distance: " + path.distance_nm.toFixed(1) + " nm"
+          );
+
+          drawnPaths[path.id] = {
+            path: path,
+            polyline: polyline,
+            marker: marker,
+          };
+          aircraftMarkers[path.id] = marker;
+          
+          console.log("[RESTORE] Completed for", path.id);
+        } catch (e) {
+          console.error("[RESTORE] Error:", e);
+        }
+      }
+
+      function createWaypointHandles() {
+        waypointHandles = [];
+        editingPathData.points.forEach(function (point, index) {
+          var isStart = index === 0;
+          var isEnd = index === editingPathData.points.length - 1;
+          var iconClass = isStart ? "start-handle" : isEnd ? "end-handle" : "waypoint-handle";
+          var icon = L.divIcon({
+            className: iconClass,
+            iconSize: [16, 16],
+            iconAnchor: [8, 8],
+          });
+          var marker = L.marker(point, {
+            icon: icon,
+            draggable: true,
+          }).addTo(editingLayer);
+
+          marker.on("drag", function (e) {
+            onWaypointDrag(index, e.target.getLatLng());
+          });
+
+          marker.on("dragend", function (e) {
+            onWaypointDragEnd(index, e.target.getLatLng());
+          });
+
+          if (!isStart && !isEnd) {
+            marker.on("contextmenu", function (e) {
+              L.DomEvent.preventDefault(e);
+              deleteWaypoint(index);
+            });
+          }
+
+          waypointHandles.push(marker);
+        });
+      }
+
+      function createInsertionHandles() {
+        insertionHandles = [];
+        for (var i = 0; i < editingPathData.points.length - 1; i++) {
+          var p1 = editingPathData.points[i];
+          var p2 = editingPathData.points[i + 1];
+          var midLat = (p1[0] + p2[0]) / 2;
+          var midLon = (p1[1] + p2[1]) / 2;
+          var icon = L.divIcon({
+            className: "insertion-handle",
+            html: "+",
+            iconSize: [14, 14],
+            iconAnchor: [7, 7],
+          });
+          var insertIndex = i + 1;
+          var marker = L.marker([midLat, midLon], {
+            icon: icon,
+            draggable: true,
+          }).addTo(editingLayer);
+
+          marker.on("dragstart", function (e) {
+            var currentIndex = insertionHandles.indexOf(e.target);
+            if (currentIndex !== -1) {
+              e.target._insertIndex = currentIndex + 1;
+            }
+          });
+
+          marker.on("dragend", function (e) {
+            var insertIdx = e.target._insertIndex;
+            var newLatLng = e.target.getLatLng();
+            insertWaypoint(insertIdx, newLatLng);
+          });
+
+          insertionHandles.push(marker);
+        }
+      }
+
+      function onWaypointDrag(index, newLatLng) {
+        editingPathData.points[index] = [newLatLng.lat, newLatLng.lng];
+        editingPolyline.setLatLngs(editingPathData.points);
+        updateInsertionHandles();
+
+        if (typeof window.drawingBridge !== "undefined") {
+          window.drawingBridge.onWaypointMoved(JSON.stringify({
+            pathId: editingPathId,
+            index: index,
+            lat: newLatLng.lat,
+            lon: newLatLng.lng,
+          }));
+        }
+      }
+
+      function onWaypointDragEnd(index, newLatLng) {
+        editingPathData.points[index] = [newLatLng.lat, newLatLng.lng];
+      }
+
+      function insertWaypoint(insertIndex, newLatLng) {
+        editingPathData.points.splice(insertIndex, 0, [newLatLng.lat, newLatLng.lng]);
+
+        if (typeof window.drawingBridge !== "undefined") {
+          window.drawingBridge.onWaypointInserted(JSON.stringify({
+            pathId: editingPathId,
+            insertIndex: insertIndex,
+            lat: newLatLng.lat,
+            lon: newLatLng.lng,
+          }));
+        }
+
+        editingLayer.clearLayers();
+        editingPolyline = L.polyline(editingPathData.points, {
+          color: editingPathData.type === "aircraft" ? "#00ff00" : "#ff0000",
+          weight: 4,
+          opacity: 0.9,
+        }).addTo(editingLayer);
+
+        createWaypointHandles();
+        createInsertionHandles();
+      }
+
+      function deleteWaypoint(index) {
+        if (editingPathData.points.length <= 2) {
+          alert("Cannot delete waypoint. Minimum 2 waypoints required.");
+          return;
+        }
+
+        editingPathData.points.splice(index, 1);
+
+        if (typeof window.drawingBridge !== "undefined") {
+          window.drawingBridge.onWaypointDeleted(JSON.stringify({
+            pathId: editingPathId,
+            index: index,
+          }));
+        }
+
+        editingLayer.clearLayers();
+        editingPolyline = L.polyline(editingPathData.points, {
+          color: editingPathData.type === "aircraft" ? "#00ff00" : "#ff0000",
+          weight: 4,
+          opacity: 0.9,
+        }).addTo(editingLayer);
+
+        createWaypointHandles();
+        createInsertionHandles();
+      }
+
+      function updateInsertionHandles() {
+        insertionHandles.forEach(function (handle) {
+          editingLayer.removeLayer(handle);
+        });
+        createInsertionHandles();
+      }
+
+      function deletePath(pathId) {
+        console.log("[DELETE]", pathId);
+        try {
+          if (!drawnPaths[pathId]) {
+            console.log("[DELETE] Path not found:", pathId);
+            return;
+          }
+
+          if (drawnPaths[pathId].polyline) {
+            if (drawnPaths[pathId].path.type === "aircraft") {
+              aircraftPathLayer.removeLayer(drawnPaths[pathId].polyline);
+            } else {
+              trackPathLayer.removeLayer(drawnPaths[pathId].polyline);
+            }
+            console.log("[DELETE] Removed polyline");
+          }
+
+          if (drawnPaths[pathId].marker) {
+            markerLayer.removeLayer(drawnPaths[pathId].marker);
+            console.log("[DELETE] Removed marker");
+          }
+
+          delete drawnPaths[pathId];
+          delete aircraftMarkers[pathId];
+          console.log("[DELETE] Completed for", pathId);
+        } catch (e) {
+          console.error("[DELETE] Error:", e);
+        }
+      }
+
+      // WebChannel connection
+      if (typeof QWebChannel !== "undefined" && typeof qt !== "undefined") {
+        new QWebChannel(qt.webChannelTransport, function (channel) {
+          window.drawingBridge = channel.objects.drawingBridge;
+
+          window.drawingBridge.enableDrawing.connect(enableDrawing);
+          window.drawingBridge.disableDrawing.connect(disableDrawing);
+          window.drawingBridge.clearAllPaths.connect(clearAllPaths);
+          window.drawingBridge.addPath.connect(addPath);
+          window.drawingBridge.updatePosition.connect(updatePositions);
+          window.drawingBridge.startPathEditing.connect(startPathEditing);
+          window.drawingBridge.stopPathEditing.connect(stopPathEditing);
+          window.drawingBridge.pathDeleted.connect(deletePath);
+          window.drawingBridge.restorePath.connect(restorePath); // NEW
+        });
+      } else {
+        console.warn("QWebChannel not available");
+      }
+
+      // Leaflet rotation plugin
+      (function () {
+        var _oldSetPos = L.Marker.prototype._setPos;
+        L.Marker.include({
+          _setPos: function (pos) {
+            _oldSetPos.call(this, pos);
+            try {
+              var inner = this._icon && this._icon.querySelector
+                ? this._icon.querySelector(".marker-inner")
+                : null;
+              if (inner && typeof this.options.rotationAngle !== "undefined") {
+                inner.style.transform = "rotate(" + this.options.rotationAngle + "deg)";
+              }
+            } catch (err) {}
+          },
+          setRotationAngle: function (angle) {
+            this.options.rotationAngle = angle;
+            try {
+              var inner = this._icon && this._icon.querySelector
+                ? this._icon.querySelector(".marker-inner")
+                : null;
+              if (inner) {
+                inner.style.transform = "rotate(" + angle + "deg)";
+              } else {
+                this.update();
+              }
+            } catch (err) {
+              this.update();
+            }
+            return this;
+          },
+        });
+      })();
+    </script>
+  </body>
+</html>
